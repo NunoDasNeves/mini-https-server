@@ -1,0 +1,17 @@
+[package]
+name = "mini_rust_server"
+version = "0.1.0"
+authors = ["Nuno Das Neves"]
+edition = "2018"
+
+[profile.dev]
+opt-level = 0
+
+[profile.release]
+opt-level = 3
+
+[dependencies]
+mio = "0.6.16"
+rustls = "0.15.1"
+daemonize = "0.4.1"
+vecio = "0.1"
