@@ -2,6 +2,7 @@
 /// The code in this file is based on rustls example code
 
 use std::sync::Arc;
+use std::rc::Rc;
 
 use mio;
 use mio::tcp::{TcpListener, TcpStream, Shutdown};
@@ -17,12 +18,15 @@ use rustls;
 
 use rustls::{Session, NoClientAuth};
 
+use crate::http::HTTPHandler;
+
 // Token for our listening socket.
 const LISTENER: mio::Token = mio::Token(0);
 
 /// This binds together a TCP listening socket, some outstanding
 /// connections, and a TLS server configuration.
-struct TlsServer {
+pub struct TlsServer {
+    handler: Rc<HTTPHandler>,
     server: TcpListener,
     connections: HashMap<mio::Token, Connection>,
     next_id: usize,
@@ -30,12 +34,72 @@ struct TlsServer {
 }
 
 impl TlsServer {
-    fn new(server: TcpListener, tls_config: Arc<rustls::ServerConfig>) -> TlsServer {
+
+    pub fn new(port: u16, handler: HTTPHandler) -> TlsServer {
+
+        let handler = Rc::new(handler);
+
+        // create socket address; an ip and a port number
+        let addr = net::SocketAddr::new(net::IpAddr::V4(net::Ipv4Addr::new(0, 0, 0, 0)), port);
+
+        // create a listener that is bound to this port
+        let server = TcpListener::bind(&addr).expect("Couldn't bind to port");
+
+        // create TLS server config
+        let mut config = rustls::ServerConfig::new(NoClientAuth::new());
+        config.key_log = Arc::new(rustls::KeyLogFile::new());
+
+        // TODO get from config
+        let certs = load_certs("cert/certificate.pem");
+        let privkey = load_private_key("cert/key.pem");
+        let ocsp = load_ocsp(&Option::None);
+
+        config.set_single_cert_with_ocsp_and_sct(certs, privkey, ocsp, vec![])
+            .expect("bad certificates/private key");
+
+        let tls_config = Arc::new(config);
+     
+        // create server object...
         TlsServer {
+            handler,
             server,
             connections: HashMap::new(),
             next_id: 2,
             tls_config,
+        }
+    }
+
+    pub fn start(&mut self) {
+        let mut poll = mio::Poll::new()
+            .unwrap();
+
+        // register listener with poll
+        poll.register(&self.server,
+                    LISTENER,                 // mio Token to be returned on a readiness event
+                    mio::Ready::readable(),   // generate an event when socket is readable
+                    mio::PollOpt::level())    // always generate events when there's data in the socket
+            .unwrap();
+
+        // receives readiness events from poll
+        let mut events = mio::Events::with_capacity(256);
+
+        loop {
+            // wait for readiness event, with no timeout
+            poll.poll(&mut events, None)
+                .unwrap();
+
+            for event in events.iter() {
+                match event.token() {
+                    // LISTENER token is used to accept() new connections
+                    LISTENER => {
+                        if !self.accept(&mut poll) {
+                            break;
+                        }
+                    }
+                    // conn_event() processes existing connections
+                    _ => self.conn_event(&mut poll, &event)
+                }
+            }
         }
     }
 
@@ -53,7 +117,7 @@ impl TlsServer {
                 self.next_id += 1;
 
                 // create a mapping between the token and a Connection
-                self.connections.insert(token, Connection::new(socket, token, tls_session));
+                self.connections.insert(token, Connection::new(socket, token, tls_session, Rc::clone(&self.handler)));
                 // register stuff with the mio::Poll so that further events from this client go to conn_event()
                 self.connections[&token].register(poll);
                 true
@@ -95,29 +159,14 @@ struct Connection {
     closing: bool,                      //
     closed: bool,                       //
     tls_session: rustls::ServerSession,
-}
-
-/// This glues our `rustls::WriteV` trait to `vecio::Rawv`.
-pub struct WriteVAdapter<'a> {
-    rawv: &'a mut dyn Rawv
-}
-
-impl<'a> WriteVAdapter<'a> {
-    pub fn new(rawv: &'a mut dyn Rawv) -> WriteVAdapter<'a> {
-        WriteVAdapter { rawv }
-    }
-}
-
-impl<'a> rustls::WriteV for WriteVAdapter<'a> {
-    fn writev(&mut self, bytes: &[&[u8]]) -> io::Result<usize> {
-        self.rawv.writev(bytes)
-    }
+    handler: Rc<HTTPHandler>,
 }
 
 impl Connection {
     fn new(socket: TcpStream,
            token: mio::Token,
-           tls_session: rustls::ServerSession)
+           tls_session: rustls::ServerSession,
+           handler: Rc<HTTPHandler>)
            -> Connection {
         Connection {
             socket,
@@ -125,6 +174,7 @@ impl Connection {
             closing: false,
             closed: false,
             tls_session,
+            handler,
         }
     }
 
@@ -194,7 +244,7 @@ impl Connection {
         // if we got something, respond based on server type
         if !buf.is_empty() {
             //println!("plaintext read {:?}", buf.len());
-            let response = crate::http::get_response(&buf);
+            let response = self.handler.get_response(&buf);
             self.tls_session
                 .write_all(&response)
                 .unwrap();
@@ -263,6 +313,23 @@ impl Connection {
     }
 }
 
+/// This glues our `rustls::WriteV` trait to `vecio::Rawv`.
+pub struct WriteVAdapter<'a> {
+    rawv: &'a mut dyn Rawv
+}
+
+impl<'a> WriteVAdapter<'a> {
+    pub fn new(rawv: &'a mut dyn Rawv) -> WriteVAdapter<'a> {
+        WriteVAdapter { rawv }
+    }
+}
+
+impl<'a> rustls::WriteV for WriteVAdapter<'a> {
+    fn writev(&mut self, bytes: &[&[u8]]) -> io::Result<usize> {
+        self.rawv.writev(bytes)
+    }
+}
+
 fn load_certs(filename: &str) -> Vec<rustls::Certificate> {
     let certfile = fs::File::open(filename).expect("cannot open certificate file");
     let mut reader = BufReader::new(certfile);
@@ -306,62 +373,4 @@ fn load_ocsp(filename: &Option<String>) -> Vec<u8> {
     }
 
     ret
-}
-
-pub fn get_listener(port: u16) -> TcpListener {
-    // create socket address; an ip and a port number
-    let addr = net::SocketAddr::new(net::IpAddr::V4(net::Ipv4Addr::new(0, 0, 0, 0)), port);
-    // create a listener that is bound to this port
-    TcpListener::bind(&addr).expect("Couldn't bind to port")
-}
-
-pub fn start(listener: TcpListener) {
-    // create TLS server config
-    let mut config = rustls::ServerConfig::new(NoClientAuth::new());
-    config.key_log = Arc::new(rustls::KeyLogFile::new());
-
-    // TODO get from config
-    let certs = load_certs("cert/certificate.pem");
-    let privkey = load_private_key("cert/key.pem");
-    let ocsp = load_ocsp(&Option::None);
-
-    config.set_single_cert_with_ocsp_and_sct(certs, privkey, ocsp, vec![])
-        .expect("bad certificates/private key");
-
-    let mut poll = mio::Poll::new()
-        .unwrap();
-
-    // register listener with poll
-    poll.register(&listener,
-                  LISTENER,                 // mio Token to be returned on a readiness event
-                  mio::Ready::readable(),   // generate an event when socket is readable
-                  mio::PollOpt::level())    // always generate events when there's data in the socket
-        .unwrap();
-
-    // create server object...
-
-    let config = Arc::new(config);
-    let mut tlsserv = TlsServer::new(listener, config);
-
-    // receives readiness events from poll
-    let mut events = mio::Events::with_capacity(256);
-
-    loop {
-        // wait for readiness event, with no timeout
-        poll.poll(&mut events, None)
-            .unwrap();
-
-        for event in events.iter() {
-            match event.token() {
-                // LISTENER token is used to accept() new connections
-                LISTENER => {
-                    if !tlsserv.accept(&mut poll) {
-                        break;
-                    }
-                }
-                // conn_event() processes existing connections
-                _ => tlsserv.conn_event(&mut poll, &event)
-            }
-        }
-    }
 }
